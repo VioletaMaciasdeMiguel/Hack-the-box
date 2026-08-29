@@ -1,0 +1,237 @@
+# Hack The Box — SpookyPass
+
+## 📌 Description
+
+**SpookyPass** is a **Very Easy** Hack The Box challenge focused on basic **Reverse Engineering** concepts.
+
+The objective is to analyze a Linux executable and determine how it performs its password verification.
+
+There is no remote machine involved in this challenge. Instead, Hack The Box provides a compressed archive containing an executable.
+
+---
+
+## 🛠️ Tools Used
+
+* Kali Linux
+* `unzip`
+* `file`
+* `strings`
+* Linux terminal
+
+---
+
+## 1. Extract the Files
+
+After downloading the ZIP file provided by Hack The Box, extract it with:
+
+```bash
+unzip SpookyPass.zip
+```
+
+This creates a directory containing the challenge executable.
+
+We can inspect the extracted files with:
+
+```bash
+ls
+cd rev_spookypass
+ls
+```
+
+---
+
+## 2. Analyze the Executable
+
+Before executing an unknown file, it is good practice to identify what type of file it is.
+
+Run:
+
+```bash
+file pass
+```
+
+The output identifies the file as a:
+
+* 64-bit ELF executable
+* x86-64 architecture
+* dynamically linked
+* PIE executable
+* **not stripped**
+
+The most interesting characteristic for this challenge is that the binary is **not stripped**.
+
+### What does "not stripped" mean?
+
+When a binary is stripped, information such as symbols and certain debugging information is removed to make analysis more difficult.
+
+A **not stripped** binary may still contain:
+
+* function names
+* symbols
+* debugging-related information
+* useful references for reverse engineering
+
+This can make the binary easier to analyze with tools such as `strings`, `objdump`, or `gdb`.
+
+---
+
+## 3. Execute the Program
+
+We can initially run the executable to understand its behavior:
+
+```bash
+./pass
+```
+
+The program displays a message asking the user for a password.
+
+Providing an incorrect password results in the program rejecting the input.
+
+This tells us that the executable contains some kind of internal password verification mechanism.
+
+---
+
+## 4. Extract Strings from the Binary
+
+Since the binary is not stripped and the program is checking a password, a good first step is to inspect its printable strings.
+
+Run:
+
+```bash
+strings pass
+```
+
+The `strings` command extracts sequences of printable characters from binary files.
+
+It is useful during initial binary analysis because it can reveal things such as:
+
+* program messages
+* function names
+* file paths
+* URLs
+* credentials
+* keys
+* hardcoded values
+
+In this challenge, the output contains the messages displayed by the program as well as a value related to the password.
+
+The position of this value is particularly interesting because it appears alongside the strings used by the password verification logic.
+
+---
+
+## 5. Analyze the Discovered Information
+
+Looking through the output of:
+
+```bash
+strings pass
+```
+
+reveals that the executable contains values directly used by the program.
+
+We can also see the function:
+
+```text
+strcmp
+```
+
+`strcmp()` is a C function used to compare two strings.
+
+Its presence provides a useful clue: the program is likely comparing the user-supplied input against a string stored inside the executable.
+
+Therefore, there is no need for brute force or a complex exploitation technique.
+
+The solution is primarily based on **extracting and analyzing information already present inside the binary**.
+
+---
+
+## 6. Verify the Result
+
+After identifying the value used by the program, run the executable again:
+
+```bash
+./pass
+```
+
+and provide the discovered value.
+
+If the comparison succeeds, the program grants access and displays the challenge result.
+
+> ⚠️ The password and flag are intentionally omitted from this write-up.
+
+---
+
+## 🧠 Key Concepts
+
+This challenge provides practice with several basic Reverse Engineering concepts.
+
+### `file`
+
+Used to identify the type of file and obtain basic information about an executable.
+
+```bash
+file pass
+```
+
+### `strings`
+
+Used to extract readable text stored inside a binary.
+
+```bash
+strings pass
+```
+
+### Stripped vs. Not Stripped Binaries
+
+A **not stripped** binary retains information that can make reverse engineering significantly easier.
+
+### `strcmp`
+
+A standard C function used to compare strings.
+
+Finding it in a binary can be an important clue when analyzing a program that asks the user for a password.
+
+---
+
+## 🎯 Methodology
+
+The complete methodology can be summarized as:
+
+```text
+Download the challenge
+        ↓
+Extract the ZIP file
+        ↓
+Identify the executable with file
+        ↓
+Check whether it is stripped
+        ↓
+Run the executable
+        ↓
+Observe the password prompt
+        ↓
+Analyze the binary with strings
+        ↓
+Identify relevant information
+        ↓
+Analyze the password verification
+        ↓
+Validate the result
+```
+
+## 💡 Conclusion
+
+SpookyPass is a simple but useful introduction to binary analysis and Reverse Engineering.
+
+The main lesson is that before moving to more advanced reverse engineering techniques, it is worth performing **basic reconnaissance of the executable**.
+
+Simple tools such as:
+
+```bash
+file
+strings
+```
+
+can quickly reveal valuable information.
+
+In this challenge, the information required to solve the problem was stored directly inside the executable, so advanced debugging or exploitation techniques were not necessary.
