@@ -1,0 +1,145 @@
+# Hack The Box — Connected: Privilege Escalation
+
+## Overview
+
+While compromising the **Connected** machine from Hack The Box, an insecure privilege-escalation path was identified that allowed the `asterisk` user to execute commands as `root`.
+
+The escalation involved an insecure **incrond** configuration combined with a configuration file used by a script executed with root privileges.
+
+> **Note:** This write-up intentionally excludes flags, credentials, IP addresses, hashes, and other sensitive lab information.
+
+## Enumeration
+
+The `incrond` service was first inspected:
+
+```bash
+systemctl status incrond
+```
+
+The service was active and running with root privileges.
+
+The system-wide `incron` configuration was then examined:
+
+```bash
+ls -la /etc/incron.d/
+```
+
+The `legacy` configuration contained an interesting rule:
+
+```text
+/var/spool/asterisk/sysadmin/dahdi_restart IN_CLOSE_WRITE /usr/sbin/sysadmin_dahdi_restart
+```
+
+This meant that a write operation on `dahdi_restart` would trigger the execution of `sysadmin_dahdi_restart`.
+
+## Permission Analysis
+
+The permissions of the trigger directory were checked:
+
+```bash
+ls -ld /var/spool/asterisk/sysadmin
+```
+
+The directory was writable by the `asterisk` user.
+
+The trigger file was also inspected:
+
+```bash
+ls -l /var/spool/asterisk/sysadmin/dahdi_restart
+```
+
+The `asterisk` user had sufficient permissions to modify the file and generate the `IN_CLOSE_WRITE` event.
+
+## Identifying the Configuration File
+
+The DAHDI initialization script was examined:
+
+```bash
+grep -n 'init.conf' /etc/init.d/dahdi
+```
+
+The output showed that `/etc/dahdi/init.conf` was loaded by the script.
+
+Its permissions were also checked:
+
+```bash
+ls -l /etc/dahdi/init.conf
+```
+
+The file was writable by `asterisk`.
+
+This was significant because the execution chain ultimately involved a process running with root privileges.
+
+## Privileged Execution Test
+
+A controlled test command was added to the configuration to write the output of `id` to a file accessible by the current user.
+
+The trigger was then activated:
+
+```bash
+touch /var/spool/asterisk/sysadmin/dahdi_restart
+```
+
+After waiting for the event to be processed, the test file contained:
+
+```text
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+This confirmed that arbitrary commands could be executed with **root privileges**.
+
+## Privilege Escalation Chain
+
+The complete attack path can be summarized as:
+
+```text
+asterisk
+   │
+   ├── can modify /etc/dahdi/init.conf
+   │
+   ├── can modify dahdi_restart
+   │
+   ▼
+incrond (root)
+   │
+   ▼
+sysadmin_dahdi_restart
+   │
+   ▼
+loads attacker-controlled configuration
+   │
+   ▼
+command execution
+   │
+   ▼
+root
+```
+
+## Obtaining Root Privileges
+
+Once root-level command execution had been confirmed, the same execution path was used to perform a controlled action on a file accessible to the `asterisk` user.
+
+This confirmed that the root flag could be accessed without including its actual contents in this write-up.
+
+## Conclusion
+
+The privilege escalation was possible due to the combination of:
+
+* An `incrond` service running as `root`.
+* An `incron` rule executing a privileged script.
+* A trigger file writable by `asterisk`.
+* A configuration file used during the privileged execution that was also writable by `asterisk`.
+
+Together, these conditions allowed the `asterisk` user to turn a seemingly limited file-write capability into **arbitrary command execution as root**.
+
+### Techniques Used
+
+* Linux privilege escalation
+* Permission enumeration
+* `incrond`
+* `inotify`
+* Script analysis
+* Configuration analysis
+* Writable-file identification
+* Arbitrary command execution
+* Privilege escalation
